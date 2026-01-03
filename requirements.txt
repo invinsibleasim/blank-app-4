@@ -1,9 +1,21 @@
+#streamlit==1.39.0
+#ultralytics==8.3.39
+
+# CPU-only PyTorch wheels (no CUDA) — suitable for Streamlit Cloud
+#torch==2.3.1+cpu
+#torchvision==0.18.1+cpu
+
+#opencv-python-headless==4.10.0.84
+#numpy==1.26.4
+#Pillow==10.3.0
+
+
 streamlit==1.39.0
 ultralytics==8.3.39
 
-# CPU-only PyTorch wheels (no CUDA) — suitable for Streamlit Cloud
-torch==2.3.1+cpu
-torchvision==0.18.1+cpu
+# CPU-only (PyPI) Torch/TV versions (no +cpu suffix)
+torch==2.3.1
+torchvision==0.18.1
 
 opencv-python-headless==4.10.0.84
 numpy==1.26.4
