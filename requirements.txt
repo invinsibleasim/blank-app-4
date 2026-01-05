@@ -13,10 +13,4 @@
 streamlit
 ultralytics
 
-# CPU-only (PyPI) Torch/TV versions (no +cpu suffix)
-torch
-torchvision
 
-opencv-python-headless==4.10.0.84
-numpy==1.26.4
-Pillow==10.3.0
