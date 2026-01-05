@@ -1,346 +1,342 @@
 
 import os
-import io
 import time
 import json
-import cv2
-import math
-import zipfile
-import numpy as np
-import streamlit as st
-from PIL import Image
+import warnings
+import tempfile
 from pathlib import Path
-from typing import Dict, Any, List, Tuple
 
-# ---------------------------
-# Ultralytics YOLO (YOLOv11)
-# ---------------------------
-ULTRA_AVAILABLE = False
+import streamlit as st
+import cv2
+import numpy as np
+import pandas as pd
+from PIL import Image
+import textwrap
+import traceback
+
+# Ultralytics YOLOv11
 try:
     from ultralytics import YOLO
-    ULTRA_AVAILABLE = True
 except Exception as e:
-    ULTRA_AVAILABLE = False
-    st.error(f"Ultralytics import failed. Install ultralytics + CPU torch in requirements.txt.\nError: {e}")
-    st.stop()
+    YOLO = None
 
-# ---------------------------
-# Utility helpers
-# ---------------------------
-def ensure_dir(path: Path):
-    path.mkdir(parents=True, exist_ok=True)
+#############################
+# Helpers & Utilities       #
+#############################
 
-def pil_to_numpy_rgb(img: Image.Image) -> np.ndarray:
-    """Convert PIL -> numpy RGB (uint8)."""
-    return np.array(img.convert("RGB"))
+def fmt_err(prefix, e):
+    """Return a robust multi-line error message."""
+    return textwrap.dedent(f"""
+        {prefix}
+        Original error: {repr(e)}
+        Traceback (most recent call last):
+        {traceback.format_exc()}
+    """)
 
-def to_three_channel_if_gray(arr: np.ndarray) -> np.ndarray:
-    """Make 3-channel RGB from single-channel IR (repeat grayscale)."""
-    if arr.ndim == 2:  # H, W
-        return np.stack([arr, arr, arr], axis=-1)
-    if arr.ndim == 3 and arr.shape[2] == 1:
-        return np.repeat(arr, 3, axis=2)
-    return arr  # already RGB/BGR-like
 
-def draw_boxes(img_bgr: np.ndarray,
-               boxes: List[List[int]],
-               classes: List[int],
-               scores: List[float],
-               class_names: List[str]) -> np.ndarray:
-    """Overlay bounding boxes + labels."""
-    vis = img_bgr.copy()
-    for (x1, y1, x2, y2), cls, score in zip(boxes, classes, scores):
-        color = (0, 255, 0)
-        cv2.rectangle(vis, (x1, y1), (x2, y2), color, 2)
-        name = class_names[cls] if cls < len(class_names) else str(cls)
-        label = f"{name} {score:.2f}"
-        cv2.putText(vis, label, (x1, max(0, y1 - 6)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2, cv2.LINE_AA)
-    return vis
+def save_uploaded_file(uploaded_file, suffix=""):
+    """Save an uploaded file to a temporary location and return its path."""
+    tmp_dir = tempfile.mkdtemp()
+    filename = uploaded_file.name
+    path = os.path.join(tmp_dir, f"{Path(filename).stem}{suffix}{Path(filename).suffix}")
+    with open(path, "wb") as f:
+        f.write(uploaded_file.getbuffer())
+    return path
 
-def parse_yolo_results(result) -> Dict[str, Any]:
-    """
-    Parse a single ultralytics result (boxes only).
-    Returns dict with boxes (xyxy int list), classes, scores.
-    """
-    out = {"boxes": [], "classes": [], "scores": []}
-    if result is None or result.boxes is None:
-        return out
-    # xyxy in tensor -> numpy
-    b = result.boxes
-    xyxy = b.xyxy.cpu().numpy().astype(int)  # shape [N,4]
-    cls = b.cls.cpu().numpy().astype(int).tolist()
-    conf = b.conf.cpu().numpy().astype(float).tolist()
-    out["boxes"] = xyxy.tolist()
-    out["classes"] = cls
-    out["scores"] = conf
-    return out
 
-def zip_in_memory(file_tuples: List[Tuple[str, bytes]]) -> io.BytesIO:
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        for zpath, data in file_tuples:
-            zf.writestr(zpath, data)
-    buf.seek(0)
-    return buf
+def parse_selected_classes(selected_names, model_names):
+    """Map selected class names to indices for Ultralytics 'classes' filter."""
+    if not selected_names:
+        return None
+    # model_names is typically a dict {idx: name}
+    if isinstance(model_names, dict):
+        name_to_idx = {v: k for k, v in model_names.items()}
+    else:
+        name_to_idx = {v: i for i, v in enumerate(model_names)}
+    indices = []
+    for name in selected_names:
+        if name in name_to_idx:
+            indices.append(name_to_idx[name])
+        else:
+            st.warning(f"Class name '{name}' not found in model.names")
+    return sorted(set(indices)) if indices else None
 
-# ---------------------------
-# Streamlit UI
-# ---------------------------
-st.set_page_config(page_title="IR Thermography Defect Detection (YOLOv11)", layout="wide")
-st.title("🌡️ IR Thermography Defect Detection — YOLOv11 (Streamlit)")
 
-st.markdown("""
-Upload **IR thermography images/videos** and a **YOLOv11 `.pt` model** (`best.pt`) to detect defects.
-The app shows overlays, counts per class, and saves outputs.
-""")
-
-# Sidebar: model upload & settings
-st.sidebar.header("🤖 Model")
-model_file = st.sidebar.file_uploader("Upload pretrained YOLOv11 model (.pt)", type=["pt"])
-conf_thres = st.sidebar.slider("Confidence (conf)", 0.05, 0.95, 0.25, 0.05)
-iou_thres  = st.sidebar.slider("IoU (NMS)", 0.10, 0.95, 0.45, 0.05)
-imgsz      = st.sidebar.selectbox("Inference size (imgsz)", [640, 512, 416], index=0)
-device     = st.sidebar.selectbox("Device", ["cpu"], index=0)  # keep CPU for Cloud
-
-st.sidebar.header("🖼️ Image & 🎥 Video")
-ir_is_grayscale = st.sidebar.checkbox("Inputs may be grayscale IR", True)
-save_dir_str    = st.sidebar.text_input("Output directory", "output")
-start_btn       = st.sidebar.button("🚀 Run detection")
-
-# Uploaders in main area
-st.subheader("Upload Images")
-img_files = st.file_uploader("Select IR images", type=["jpg", "jpeg", "png", "bmp", "tif", "tiff"], accept_multiple_files=True)
-
-st.subheader("Upload Videos")
-vid_files = st.file_uploader("Select IR videos", type=["mp4", "avi", "mov", "mkv"], accept_multiple_files=True)
-
-# ---------------------------
-# Run
-# ---------------------------
-if start_btn:
-    # Load model
-    if model_file is None:
-        st.error("Please upload a YOLOv11 `.pt` model first.")
-        st.stop()
-
-    # Persist model to disk
-    models_dir = Path("models"); ensure_dir(models_dir)
-    model_path = models_dir / model_file.name
-    with open(model_path, "wb") as f:
-        f.write(model_file.read())
-
+@st.cache_resource(show_spinner=True)
+def load_yolov11_model(weights_path, device=None):
+    """Load Ultralytics YOLO (v11) model from weights."""
+    if YOLO is None:
+        raise RuntimeError("Ultralytics package not found. Please install with: pip install ultralytics")
     try:
-        model = YOLO(str(model_path))
+        model = YOLO(weights_path)
     except Exception as e:
-        st.error(f"Failed to load YOLOv11 model: {e}")
+        raise RuntimeError(fmt_err("Failed to load YOLOv11 model from given weights.", e))
+    # device is handled at predict-time in Ultralytics
+    return model
+
+
+def run_inference_on_image(model, img_path, out_dir, imgsz, conf, iou, 
+                           classes=None, agnostic_nms=False, device=None, out_ext="jpg"):
+    """Run inference and save annotated IR image (jpg/png) + CSV of detections."""
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        results = model.predict(
+            source=str(img_path),
+            conf=float(conf),
+            iou=float(iou),
+            imgsz=int(imgsz),
+            device=None if (device is None or device == 'auto') else device,
+            classes=classes,  # list of class indices or None
+            agnostic_nms=bool(agnostic_nms),
+            verbose=False,
+        )
+    except Exception as e:
+        raise RuntimeError(fmt_err(f"Prediction failed for image: {img_path}", e))
+
+    # Expect one result per image
+    if not results:
+        warnings.warn("No results returned.")
+        return None
+
+    r = results[0]
+
+    # Annotated image with bounding boxes
+    try:
+        im_annot = r.plot()  # numpy array (BGR)
+        stem = Path(img_path).stem
+        ext = ".png" if str(out_ext).lower() == "png" else ".jpg"
+        out_img_path = out_dir / f"{stem}{ext}"
+        cv2.imwrite(str(out_img_path), im_annot)
+    except Exception as e:
+        warnings.warn(f"Could not render/save annotated image: {e}")
+
+    # Save CSV of detections
+    try:
+        boxes = r.boxes  # Boxes object
+        xyxy = boxes.xyxy.cpu().numpy() if hasattr(boxes.xyxy, 'cpu') else boxes.xyxy
+        confs = boxes.conf.cpu().numpy() if hasattr(boxes.conf, 'cpu') else boxes.conf
+        clss = boxes.cls.cpu().numpy() if hasattr(boxes.cls, 'cpu') else boxes.cls
+
+        # model.names may be dict
+        names_map = getattr(model, 'names', None)
+        if names_map is None:
+            names_map = getattr(model.model, 'names', None)
+        def cls_to_name(i):
+            try:
+                if isinstance(names_map, dict):
+                    return names_map.get(int(i), str(int(i)))
+                else:
+                    return names_map[int(i)] if names_map is not None else str(int(i))
+            except Exception:
+                return str(int(i))
+
+        rows = []
+        for j in range(len(xyxy)):
+            x1, y1, x2, y2 = xyxy[j]
+            rows.append({
+                'xmin': float(x1), 'ymin': float(y1), 'xmax': float(x2), 'ymax': float(y2),
+                'confidence': float(confs[j]), 'class': int(clss[j]), 'name': cls_to_name(clss[j])
+            })
+        df = pd.DataFrame(rows)
+        stem = Path(img_path).stem
+        (out_dir / f"{stem}.csv").write_text(df.to_csv(index=False))
+    except Exception as e:
+        warnings.warn(f"Could not save detection CSV: {e}")
+
+    return r
+
+
+#############################
+# Streamlit UI              #
+#############################
+
+st.set_page_config(page_title="IR Thermography Defect Detection (YOLOv11)", layout="wide")
+
+st.title("IR Thermography Defect Detection using YOLOv11 (best.pt)")
+st.write(
+    "Upload IR thermal images and a trained Ultralytics YOLOv11 weights file (best.pt). Configure confidence, IOU, classes, and output format, "
+    "then run detection. Annotated images (JPG/PNG with bounding boxes) and CSVs will be saved to a run folder."
+)
+
+with st.sidebar:
+    st.header("Model & Settings")
+    weights_upload = st.file_uploader("Upload YOLOv11 weights (.pt)", type=["pt"], accept_multiple_files=False)
+
+    device_choice = st.selectbox("Device", options=["auto", "cpu", "cuda"], index=0)
+
+    conf_thres = st.slider("Confidence threshold", 0.0, 1.0, 0.25, 0.01)
+    iou_thres = st.slider("NMS IoU threshold", 0.0, 1.0, 0.45, 0.01)
+    imgsz = st.number_input("Image size (pixels)", min_value=320, max_value=4096, value=1280, step=64)
+    agnostic_nms = st.checkbox("Agnostic NMS", value=False)
+
+    max_det = st.number_input("Max detections (predict-time)", min_value=1, max_value=10000, value=1000, step=10,
+                              help="Ultralytics caps per-image detections internally; this control is informational.")
+
+    out_root = st.text_input("Output root folder", value="./runs/ir_streamlit")
+    out_ext = st.radio("Output image format", options=["jpg", "png"], index=0)
+
+st.divider()
+
+st.subheader("Upload IR images")
+uploaded_images = st.file_uploader(
+    "Upload one or more IR images (JPG/PNG/BMP/TIFF)", type=["jpg", "jpeg", "png", "bmp", "tif", "tiff"], accept_multiple_files=True
+)
+
+run_btn = st.button("Run Detection", type="primary")
+
+model = None
+weights_path = None
+
+if weights_upload is not None:
+    weights_path = save_uploaded_file(weights_upload)
+
+if run_btn:
+    if YOLO is None:
+        st.error("Ultralytics package not found. Please install: pip install ultralytics")
+        st.stop()
+    if weights_path is None:
+        st.error("Please upload a YOLOv11 weights file (best.pt) to proceed.")
+        st.stop()
+    if not uploaded_images:
+        st.error("Please upload at least one IR image.")
         st.stop()
 
-    # Show model classes
+    # Load model
     try:
-        model_names = model.names  # dict {id: name}
-        class_names = [model_names[i] for i in sorted(model_names.keys())]
-    except Exception:
-        # fallback if names missing
-        num_classes = int(st.number_input("Enter number of model classes", min_value=1, value=1))
-        class_names = [f"class_{i}" for i in range(num_classes)]
+        with st.spinner("Loading YOLOv11 model..."):
+            model = load_yolov11_model(weights_path, device=device_choice)
+    except Exception as e:
+        st.error(fmt_err("Loading YOLOv11 model failed.", e))
+        st.stop()
 
-    st.success(f"Model loaded: **{model_path.name}**")
-    st.info(f"Number of classes in model: **{len(class_names)}** — {class_names}")
+    st.success("Model loaded.")
 
-    # Output dir
-    out_base = Path(save_dir_str); ensure_dir(out_base)
+    # Class selection UI (after model is loaded so we can read model.names)
+    names_map = getattr(model, 'names', None)
+    if names_map is None:
+        names_map = getattr(model.model, 'names', None)
+    if isinstance(names_map, dict):
+        cls_display = [names_map[i] for i in sorted(names_map.keys())]
+    else:
+        cls_display = list(names_map) if names_map is not None else []
 
-    # -----------------------
-    # Process Images
-    # -----------------------
-    if img_files:
-        st.subheader("Image results")
-        img_zip_tuples = []  # (zip_path, bytes)
-        agg_counts_img: Dict[str, int] = {}
-        for upl in img_files:
-            # Load image
-            img = Image.open(io.BytesIO(upl.read()))
-            rgb = pil_to_numpy_rgb(img)
-            if ir_is_grayscale:
-                # If original was single-channel, ensure 3-channel
-                if rgb.ndim == 2 or (rgb.ndim == 3 and rgb.shape[2] == 1):
-                    rgb = to_three_channel_if_gray(rgb)
+    selected_cls_names = st.multiselect("Select classes to detect (optional)", options=cls_display)
+    selected_cls_indices = parse_selected_classes(selected_cls_names, names_map)
 
-            # Ultralytics expects RGB array
-            # Run inference
-            results = model.predict(
-                source=rgb,
-                imgsz=int(imgsz),
-                conf=conf_thres,
-                iou=iou_thres,
-                device=device,
-                verbose=False
-            )
+    # Prepare output directory
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    out_dir = Path(out_root) / f"run_{ts}"
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-            r = results[0]
-            parsed = parse_yolo_results(r)
+    # Save run config
+    cfg = {
+        "weights": weights_upload.name if weights_upload else None,
+        "device": device_choice,
+        "conf": conf_thres,
+        "iou": iou_thres,
+        "imgsz": imgsz,
+        "agnostic_nms": agnostic_nms,
+        "selected_classes": selected_cls_names,
+        "out_dir": str(out_dir),
+        "out_ext": out_ext,
+    }
+    (out_dir / "run_config.json").write_text(json.dumps(cfg, indent=2))
 
-            # Overlay on BGR for drawing then convert back
-            bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
-            vis_bgr = draw_boxes(bgr, parsed["boxes"], parsed["classes"], parsed["scores"], class_names)
-            vis_rgb = cv2.cvtColor(vis_bgr, cv2.COLOR_BGR2RGB)
+    # Layout for preview and tables
+    cols = st.columns(2)
+    left, right = cols
 
-            # Save to disk
-            save_dir = out_base / Path(upl.name).stem
-            ensure_dir(save_dir)
-            out_img_path = save_dir / "overlay.jpg"
-            Image.fromarray(vis_rgb).save(out_img_path, format="JPEG", quality=95)
-
-            # Aggregate counts
-            for cid in parsed["classes"]:
-                cname = class_names[cid] if cid < len(class_names) else str(cid)
-                agg_counts_img[cname] = agg_counts_img.get(cname, 0) + 1
-
-            # Show in UI
-            st.image(vis_rgb, caption=f"{upl.name} — detections: {len(parsed['boxes'])}", use_column_width=True)
-            st.json({
-                "file": upl.name,
-                "num_boxes": len(parsed["boxes"]),
-                "classes": [class_names[c] if c < len(class_names) else str(c) for c in parsed["classes"]],
-                "scores": parsed["scores"]
-            })
-
-            # Add to ZIP (overlay + a JSON summary)
-            with open(out_img_path, "rb") as f:
-                img_zip_tuples.append((f"{Path(upl.name).stem}/overlay.jpg", f.read()))
-            summary_json = json.dumps({
-                "file": upl.name,
-                "num_boxes": len(parsed["boxes"]),
-                "classes": [class_names[c] if c < len(class_names) else str(c) for c in parsed["classes"]],
-                "scores": parsed["scores"]
-            }, indent=2).encode("utf-8")
-            img_zip_tuples.append((f"{Path(upl.name).stem}/summary.json", summary_json))
-
-        # Download ZIP with all image overlays
-        if img_zip_tuples:
-            img_zip = zip_in_memory(img_zip_tuples)
-            st.download_button("📦 Download all image overlays (ZIP)", data=img_zip, file_name="images_results.zip")
-
-        # Show aggregated counts
-        if agg_counts_img:
-            st.info("Aggregated image detections per class:")
-            st.json(agg_counts_img)
-
-    # -----------------------
-    # Process Videos
-    # -----------------------
-    if vid_files:
-        st.subheader("Video results")
-        frame_stride = st.slider("Process every Nth frame (stride)", 1, 10, 2, 1)
-        max_frames   = st.slider("Max frames to process (per video)", 50, 2000, 300, 50)
-
-        for upl in vid_files:
-            # Persist video to disk for OpenCV
-            vid_tmp = Path("tmp_videos"); ensure_dir(vid_tmp)
-            vid_path = vid_tmp / upl.name
-            with open(vid_path, "wb") as f:
-                f.write(upl.read())
-
-            cap = cv2.VideoCapture(str(vid_path))
-            if not cap.isOpened():
-                st.error(f"Cannot open video: {upl.name}")
-                continue
-
-            fps = cap.get(cv2.CAP_PROP_FPS) or 25
-            width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-            height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-
-            # Prepare writer
-            out_dir = out_base / Path(upl.name).stem
-            ensure_dir(out_dir)
-            out_video_path = out_dir / "overlay.mp4"
-            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-            writer = cv2.VideoWriter(str(out_video_path), fourcc, fps, (width, height))
-
-            # Aggregated counts for this video
-            agg_counts_vid: Dict[str, int] = {}
-            processed = 0
-            pbar = st.progress(0.0)
-
-            frame_idx = 0
-            while cap.isOpened() and processed < max_frames:
-                ret, frame_bgr = cap.read()
-                if not ret:
-                    break
-                if frame_idx % frame_stride != 0:
-                    frame_idx += 1
-                    continue
-
-                # Convert to RGB for YOLO
-                frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-
-                # If IR grayscale expected (rare in videos), convert if needed
-                if ir_is_grayscale and frame_rgb.ndim == 2:
-                    frame_rgb = to_three_channel_if_gray(frame_rgb)
-
-                # Run inference
-                results = model.predict(
-                    source=frame_rgb,
+    results_summary = []
+    for i, upl in enumerate(uploaded_images):
+        with st.spinner(f"Processing image {i+1}/{len(uploaded_images)}: {upl.name}"):
+            img_path = save_uploaded_file(upl, suffix="")
+            try:
+                res = run_inference_on_image(
+                    model=model,
+                    img_path=img_path,
+                    out_dir=out_dir,
                     imgsz=int(imgsz),
                     conf=conf_thres,
                     iou=iou_thres,
-                    device=device,
-                    verbose=False
+                    classes=selected_cls_indices,
+                    agnostic_nms=agnostic_nms,
+                    device=device_choice,
+                    out_ext=out_ext,
                 )
-                r = results[0]
-                parsed = parse_yolo_results(r)
+            except Exception as e:
+                st.error(fmt_err(f"Inference failed for {upl.name}.", e))
+                continue
 
-                # Draw and write
-                vis_bgr = draw_boxes(frame_bgr, parsed["boxes"], parsed["classes"], parsed["scores"], class_names)
-                writer.write(vis_bgr)
+            # Display annotated image
+            stem = Path(img_path).stem
+            annotated_path = Path(out_dir) / f"{stem}.{out_ext}"
+            if annotated_path.exists():
+                try:
+                    img = Image.open(annotated_path)
+                    left.image(img, caption=f"Annotated: {upl.name}", use_column_width=True)
+                except Exception:
+                    im_bgr = cv2.imread(str(annotated_path))
+                    if im_bgr is not None:
+                        im_rgb = cv2.cvtColor(im_bgr, cv2.COLOR_BGR2RGB)
+                        left.image(im_rgb, caption=f"Annotated: {upl.name}", use_column_width=True)
+                    else:
+                        st.warning("Annotated image could not be opened for preview.")
+            else:
+                st.warning("Annotated image not found; check output folder.")
 
-                # Aggregate class counts
-                for cid in parsed["classes"]:
-                    cname = class_names[cid] if cid < len(class_names) else str(cid)
-                    agg_counts_vid[cname] = agg_counts_vid.get(cname, 0) + 1
+            # Show table of detections
+            try:
+                if res is not None:
+                    boxes = res.boxes
+                    xyxy = boxes.xyxy.cpu().numpy() if hasattr(boxes.xyxy, 'cpu') else boxes.xyxy
+                    confs = boxes.conf.cpu().numpy() if hasattr(boxes.conf, 'cpu') else boxes.conf
+                    clss = boxes.cls.cpu().numpy() if hasattr(boxes.cls, 'cpu') else boxes.cls
 
-                processed += 1
-                pbar.progress(min(1.0, processed / max_frames))
-                frame_idx += 1
+                    def cls_to_name(i):
+                        try:
+                            if isinstance(names_map, dict):
+                                return names_map.get(int(i), str(int(i)))
+                            else:
+                                return names_map[int(i)] if names_map is not None else str(int(i))
+                        except Exception:
+                            return str(int(i))
 
-            cap.release()
-            writer.release()
+                    rows = []
+                    for j in range(len(xyxy)):
+                        x1, y1, x2, y2 = xyxy[j]
+                        rows.append({
+                            'xmin': float(x1), 'ymin': float(y1), 'xmax': float(x2), 'ymax': float(y2),
+                            'confidence': float(confs[j]), 'class': int(clss[j]), 'name': cls_to_name(clss[j])
+                        })
+                    df = pd.DataFrame(rows)
+                    right.dataframe(df, use_container_width=True)
+                    results_summary.append({"image": upl.name, "detections": len(df)})
+                else:
+                    st.warning("No detections returned.")
+            except Exception as e:
+                st.warning(f"No detections table available: {e}")
 
-            st.success(f"Processed video {upl.name}: {processed} frames (stride={frame_stride})")
-            st.video(str(out_video_path))
+    # Summary & download
+    st.success(f"Completed. Outputs saved to: {out_dir}")
 
-            # Save per-video summary
-            with open(out_dir / "summary.json", "w") as f:
-                json.dump({
-                    "video": upl.name,
-                    "processed_frames": processed,
-                    "stride": frame_stride,
-                    "imgsz": imgsz,
-                    "conf": conf_thres,
-                    "iou": iou_thres,
-                    "class_counts": agg_counts_vid
-                }, f, indent=2)
+    if results_summary:
+        st.subheader("Detection summary")
+        st.table(pd.DataFrame(results_summary))
 
-            st.info(f"Classes detected in {upl.name}:")
-            st.json(agg_counts_vid)
-
-            # Offer ZIP of video outputs
-            zip_buf = io.BytesIO()
-            with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
-                # add overlay video
-                with open(out_video_path, "rb") as vf:
-                    zf.writestr(f"{Path(upl.name).stem}/overlay.mp4", vf.read())
-                # add summary
-                with open(out_dir / "summary.json", "rb") as sf:
-                    zf.writestr(f"{Path(upl.name).stem}/summary.json", sf.read())
-            zip_buf.seek(0)
+    # Zip download
+    try:
+        import shutil
+        zip_path = str(out_dir) + ".zip"
+        shutil.make_archive(str(out_dir), "zip", str(out_dir))
+        with open(zip_path, "rb") as f:
             st.download_button(
-                f"📦 Download outputs for {upl.name} (ZIP)",
-                data=zip_buf,
-                file_name=f"{Path(upl.name).stem}_results.zip"
+                label="Download all outputs (ZIP)",
+                data=f,
+                file_name=os.path.basename(zip_path),
+                mime="application/zip",
             )
+    except Exception as e:
+        st.warning(fmt_err("Could not create ZIP archive for outputs.", e))
 
-st.markdown("---")
-st.caption("Notes: IR images may be grayscale; this app repeats the channel to match YOLO’s RGB input. Adjust confidence/IoU for your data. For long videos, increase stride or set max frames.")
